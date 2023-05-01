@@ -1,35 +1,43 @@
 #include <AHT10.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 #include <ArduinoJson.h>
 #include <ArduinoOTA.h>
 #include <DNSServer.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266WiFi.h>
+#include <LittleFS.h>
 #include <PubSubClient.h>
 #include <WiFiManager.h>
 #include <cstdio>
+#include <cstring>
+#include <debugstream.hpp>
+#include <iterator>
+#include <memory>
+#include <vector>
 
 uint8_t mqttRetryCounter = 0;
 
-AHT10        aht;
-WiFiManager  wifiManager;
-WiFiClient   wifiClient;
+Adafruit_SSD1306 display(128, 32, &Wire, -1); // pixels
+AHT10 aht;
+WiFiManager wifiManager;
+WiFiClient wifiClient;
 PubSubClient mqttClient;
+DebugStream debug(&Serial);
 
+char ssid[80];
+char pass[80];
 char mqtt_server[80];
-char mqtt_username[80];
-char mqtt_password[80];
 
-WiFiManagerParameter mqtt_server_param("server", "MQTT Server", mqtt_server, sizeof(mqtt_server));
-WiFiManagerParameter mqtt_user_param("user", "MQTT Username", mqtt_username, sizeof(mqtt_username));
-WiFiManagerParameter mqtt_pass_param("pass", "MQTT Password", mqtt_password, sizeof(mqtt_password));
+WiFiManagerParameter mqtt_server_param("server", "MQTT Server", mqtt_server,
+        sizeof(mqtt_server));
 
 uint32_t lastMqttConnectionAttempt = 0;
 
 // 1 minute = 60 seconds = 60000 milliseconds
 const uint16_t mqttConnectionInterval = 60000;
 
-uint32_t statusPublishPreviousMillis = 0;
-const uint16_t statusPublishInterval = 30000; // 30 seconds = 30000 milliseconds
+const uint16_t PUBLISH_INTERVAL = 30000; // 30 seconds = 30000 milliseconds
 
 char identifier[24];
 
@@ -42,6 +50,13 @@ char MQTT_TOPIC_COMMAND[128];
 
 char MQTT_TOPIC_AUTOCONF_WIFI_SENSOR[128];
 char MQTT_TOPIC_AUTOCONF_PM25_SENSOR[128];
+
+void resetDisplayText(Adafruit_SSD1306 &display) {
+    display.clearDisplay();
+    display.setTextColor(WHITE);
+    display.setCursor(0, 0);
+    display.setTextSize(1);
+}
 
 void publishAutoConfig() {
     char mqttPayload[2048];
@@ -123,64 +138,58 @@ void publishAutoConfig() {
     autoconfPayload.clear();
 }
 
-void saveConfigCallback() {}
+void saveConfigCallback() {
+    debug.println("Saving config");
+    // Minimum reservation size in LittleFS is 4K?
+    DynamicJsonDocument config_json(512);
 
-void mqttCallback(char *topic, uint8_t *payload, unsigned int length) {}
+    // Store Wifi SSID and password in plaintext lol
+    config_json["mqtt_server"] = mqtt_server_param.getValue();
 
-void setupWifi() {
-    Serial.printf("WiFi hostname: %s\n", identifier);
-    WiFi.hostname(identifier);
-
-    wifiManager.setDebugOutput(true);
-    wifiManager.addParameter(&mqtt_server_param);
-    wifiManager.addParameter(&mqtt_user_param);
-    wifiManager.addParameter(&mqtt_pass_param);
-
-    wifiManager.setSaveConfigCallback(saveConfigCallback);
-    wifiManager.autoConnect(identifier);
-
-    mqttClient.setClient(wifiClient);
-    strcpy(mqtt_server, mqtt_server_param.getValue());
-    strcpy(mqtt_username, mqtt_user_param.getValue());
-    strcpy(mqtt_password, mqtt_pass_param.getValue());
-
-    if (mqtt_server_param.getValueLength() < 1) {
-        // No values? Reset and request from user
-        Serial.printf("Missing MQTT server, resetting and asking user.\n");
-        wifiManager.resetSettings();
-        wifiManager.autoConnect();
+    File config = LittleFS.open("/config.json", "w");
+    if (config) {
+        debug.println(config_json.as<String>());
+        serializeJson(config_json, config);
+        config.close();
     }
-    
-    Serial.printf("MQTT Server: %s\n", mqtt_server);
+}
 
-    mqttClient.setServer(mqtt_server, 1883);
-    mqttClient.setKeepAlive(10);
-    mqttClient.setBufferSize(2048);
-    mqttClient.setCallback(mqttCallback);
+void mqttCallback(char *topic, uint8_t *payload, unsigned int length) {
+    debug.printf("mqttCallback: %s: %s (%d)\n", topic, payload, length);
+}
+
+void configModeCallback(WiFiManager *myWiFiManager) {
+    debug.println("Entered config mode");
+    debug.println(WiFi.softAPIP());
+
+    debug.println(myWiFiManager->getConfigPortalSSID());
 }
 
 void setupOTA() {
-    ArduinoOTA.onStart([]() { Serial.println("OTA Start"); });
-    ArduinoOTA.onEnd([]() { Serial.println("\nOTA End"); });
+    display.println("Setup OTA...");
+    display.display();
+
+    ArduinoOTA.onStart([]() { debug.println("OTA Start"); });
+    ArduinoOTA.onEnd([]() { debug.println("\nOTA End"); });
 
     ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-        Serial.printf("OTA Progress: %u%%\r", (progress / (total / 100)));
-    });
+            debug.printf("OTA Progress: %u%%\r", (progress / (total / 100)));
+            });
 
     ArduinoOTA.onError([](ota_error_t error) {
-        Serial.printf("Error[%u]: ", error);
-        if (error == OTA_AUTH_ERROR) {
-            Serial.println("Auth Failed");
-        } else if (error == OTA_BEGIN_ERROR) {
-            Serial.println("Begin Failed");
-        } else if (error == OTA_CONNECT_ERROR) {
-            Serial.println("Connect Failed");
-        } else if (error == OTA_RECEIVE_ERROR) {
-            Serial.println("Receive Failed");
-        } else if (error == OTA_END_ERROR) {
-            Serial.println("End Failed");
-        }
-    });
+            debug.printf("Error[%u]: ", error);
+            if (error == OTA_AUTH_ERROR) {
+            debug.println("Auth Failed");
+            } else if (error == OTA_BEGIN_ERROR) {
+            debug.println("Begin Failed");
+            } else if (error == OTA_CONNECT_ERROR) {
+            debug.println("Connect Failed");
+            } else if (error == OTA_RECEIVE_ERROR) {
+            debug.println("Receive Failed");
+            } else if (error == OTA_END_ERROR) {
+            debug.println("End Failed");
+            }
+            });
 
     ArduinoOTA.setHostname(identifier);
 
@@ -190,13 +199,29 @@ void setupOTA() {
 }
 
 void mqttReconnect() {
-    Serial.println("Reconnect mqtt...");
-    for (uint8_t attempt = 0; attempt < 10; attempt++) {
-        Serial.printf("Attempt %d\n", attempt);
-        if (mqttClient.connect(identifier, mqtt_username, mqtt_password,
-                    MQTT_TOPIC_AVAILABILITY, 1, true,
-                    AVAILABILITY_OFFLINE)) {
+    display.println("Reconnect MQTT...");
+    display.display();
 
+    debug.println("Reconnect MQTT...");
+
+    if (std::strcmp(mqtt_server_param.getValue(), "") == 0) {
+        // No values? Reset and request from user
+        debug.printf("Missing MQTT server, resetting and asking user.\n");
+
+        resetDisplayText(display);
+        display.println("Connect to ESP wifi...");
+        display.display();
+
+        wifiManager.resetSettings();
+        wifiManager.autoConnect();
+    }
+
+    for (uint8_t attempt = 0; attempt < 10; attempt++) {
+        debug.printf("Attempt %d\n", attempt);
+        debug.printf("mqtt: %s\n", mqtt_server);
+        if (mqttClient.connect(identifier, "", "", MQTT_TOPIC_AVAILABILITY, 1, true,
+                    AVAILABILITY_OFFLINE)) {
+            debug.println("Mqtt connected");
             mqttClient.publish(MQTT_TOPIC_AVAILABILITY, AVAILABILITY_ONLINE, true);
             publishAutoConfig();
 
@@ -205,57 +230,17 @@ void mqttReconnect() {
             mqttClient.subscribe(MQTT_TOPIC_COMMAND);
             break;
         }
-        delay(1000);
+        delay(3000);
     }
-}
-
-void setup() {
-    delay(300);
-
-    Serial.begin(115200);
-    aht.begin(SDA, SCL);
-    aht.setCycleMode();
-
-    Serial.println("\n");
-    Serial.println("\n");
-    Serial.println("\n");
-    Serial.printf("Core Version: %s\n", ESP.getCoreVersion().c_str());
-    Serial.printf("Boot Version: %u\n", ESP.getBootVersion());
-    Serial.printf("Boot Mode: %u\n", ESP.getBootMode());
-    Serial.printf("CPU Frequency: %u MHz\n", ESP.getCpuFreqMHz());
-    Serial.printf("Reset reason: %s\n", ESP.getResetReason().c_str());
-
-    // Create topic strings
-    snprintf(identifier,              sizeof(identifier),              "AHT10-%X",      ESP.getChipId());  
-    snprintf(MQTT_TOPIC_AVAILABILITY, sizeof(MQTT_TOPIC_AVAILABILITY), "%s/%s/status",  FIRMWARE_PREFIX, identifier);
-    snprintf(MQTT_TOPIC_STATE,        sizeof(MQTT_TOPIC_STATE),        "%s/%s/state",   FIRMWARE_PREFIX, identifier);
-    snprintf(MQTT_TOPIC_COMMAND,      sizeof(MQTT_TOPIC_COMMAND),      "%s/%s/command", FIRMWARE_PREFIX, identifier);
-
-    snprintf(MQTT_TOPIC_AUTOCONF_PM25_SENSOR, sizeof(MQTT_TOPIC_AUTOCONF_PM25_SENSOR),
-            "homeassistant/sensor/%s/%s_pm25/config", FIRMWARE_PREFIX,
-            identifier);
-    snprintf(MQTT_TOPIC_AUTOCONF_WIFI_SENSOR, sizeof(MQTT_TOPIC_AUTOCONF_WIFI_SENSOR),
-            "homeassistant/sensor/%s/%s_wifi/config", FIRMWARE_PREFIX,
-            identifier);
-
-    Serial.printf("MQTT_TOPIC_AVAILABILITY: %s\n", MQTT_TOPIC_AVAILABILITY);
-    Serial.printf("MQTT_TOPIC_STATE: %s\n", MQTT_TOPIC_STATE);
-    Serial.printf("MQTT_TOPIC_COMMAND: %s\n", MQTT_TOPIC_COMMAND);
-    Serial.printf("MQTT_TOPIC_AUTOCONF_PM25_SENSOR: %s\n", MQTT_TOPIC_AUTOCONF_PM25_SENSOR);
-    Serial.printf("MQTT_TOPIC_AUTOCONF_WIFI_SENSOR: %s\n", MQTT_TOPIC_AUTOCONF_WIFI_SENSOR);
-
-    setupWifi();
-    setupOTA();
-
-    Serial.printf("Hostname: %s\n", identifier);
-    Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
-
-    mqttReconnect();
 }
 
 void publishState(float degC, float relHumid) {
     DynamicJsonDocument wifiJson(192);
     DynamicJsonDocument stateJson(604);
+    resetDisplayText(display);
+    display.printf("%2.1f C\n", degC);
+    display.printf("%3.1f %% RH\n", relHumid);
+
     char payload[256];
 
     wifiJson["ssid"] = WiFi.SSID();
@@ -266,28 +251,75 @@ void publishState(float degC, float relHumid) {
     stateJson["relHumid"] = relHumid;
     stateJson["wifi"] = wifiJson.as<JsonObject>();
 
-    serializeJson(stateJson, payload);
-    Serial.println("Publish");
-    Serial.println(payload);
+    serializeJson(stateJson, payload, sizeof(payload));
+    debug.println("Publish");
+    debug.println(payload);
     mqttClient.publish(MQTT_TOPIC_STATE, payload, true);
 }
 
+void setup() {
+    Serial.begin(921600);
+    aht.begin();
+    display.begin();
+    resetDisplayText(display);
+
+    debug.println("\n");
+    debug.println("Hello from esp8266-vindriktning-particle-sensor");
+    debug.printf("Core Version: %s\n", ESP.getCoreVersion().c_str());
+    debug.printf("Boot Version: %u\n", ESP.getBootVersion());
+    debug.printf("Boot Mode: %u\n", ESP.getBootMode());
+    debug.printf("CPU Frequency: %u MHz\n", ESP.getCpuFreqMHz());
+    debug.printf("Reset reason: %s\n", ESP.getResetReason().c_str());
+
+    snprintf(identifier, sizeof(identifier), "VINDRIKTNING-%X", ESP.getChipId());
+    snprintf(MQTT_TOPIC_AVAILABILITY, 127, "%s/%s/status", FIRMWARE_PREFIX,
+            identifier);
+    snprintf(MQTT_TOPIC_STATE, 127, "%s/%s/state", FIRMWARE_PREFIX, identifier);
+    snprintf(MQTT_TOPIC_COMMAND, 127, "%s/%s/command", FIRMWARE_PREFIX,
+            identifier);
+
+    snprintf(MQTT_TOPIC_AUTOCONF_PM25_SENSOR, 127,
+            "homeassistant/sensor/%s/%s_pm25/config", FIRMWARE_PREFIX,
+            identifier);
+    snprintf(MQTT_TOPIC_AUTOCONF_WIFI_SENSOR, 127,
+            "homeassistant/sensor/%s/%s_wifi/config", FIRMWARE_PREFIX,
+            identifier);
+
+    wifiManager.addParameter(&mqtt_server_param);
+    wifiManager.setAPCallback(configModeCallback);
+    wifiManager.setSaveConfigCallback(saveConfigCallback);
+    wifiManager.setConfigPortalTimeout(3 * 60);
+    wifiManager.autoConnect();
+
+    mqttClient.setClient(wifiClient);
+    mqttClient.setServer(mqtt_server_param.getValue(), 1883);
+    mqttClient.setKeepAlive(10);
+    mqttClient.setBufferSize(2048);
+    mqttClient.setCallback(mqttCallback);
+
+    setupOTA();
+    mqttReconnect();
+}
+
 void loop() {
+    static uint32_t previousPublishMs = 0;
+
     ArduinoOTA.handle();
     mqttClient.loop();
 
     const uint32_t currentMillis = millis();
-    if (currentMillis - statusPublishPreviousMillis >= statusPublishInterval) {
-        statusPublishPreviousMillis = currentMillis;
+    if (currentMillis - previousPublishMs >= PUBLISH_INTERVAL) {
+        previousPublishMs = currentMillis;
 
-        Serial.println("Read sensor");
+        debug.println("Read sensor");
         if (aht.readRawData() != AHT10_ERROR) {
             publishState(aht.readTemperature(), aht.readHumidity());
         }
     }
 
-    if (!mqttClient.connected() &&
-            currentMillis - lastMqttConnectionAttempt >= mqttConnectionInterval) {
+    bool mqttConnectionTimeout =
+        currentMillis - lastMqttConnectionAttempt >= mqttConnectionInterval;
+    if (!mqttClient.connected() && mqttConnectionTimeout) {
         lastMqttConnectionAttempt = currentMillis;
         mqttReconnect();
     }
